@@ -89,13 +89,50 @@ of re-signing the whole IPA.
 
 ## Frida pattern approach (Method B)
 
-The engine binary is stripped, so the certificate-verification function
-(`ssl_crypto_x509_session_verify_cert_chain` / the routine feeding `ssl_verify_result`)
-has no exported symbol. It is located by scanning the module's executable memory
-for an instruction **byte pattern**, then replacing its logic so verification
-always succeeds.
+The engine binary is stripped, so BoringSSL's certificate-verification routine
+(`ssl_verify_peer_cert` in `handshake.cc`, which feeds `ssl_verify_result`) has no
+exported symbol. It is located by scanning the module's executable memory for an
+instruction **byte pattern**, then neutralised so verification always succeeds.
 
 Patterns are specific to CPU architecture (arm64, arm, x86_64) **and** to the
 Flutter engine version, so a pattern that works on one build will not match
-another. Keep patterns current from the `disable-flutter-tls-verification`
-project rather than hardcoding a single value. See `scripts/flutter-tls-bypass.js`.
+another. Two failure modes follow from that, and the second is the dangerous one:
+
+- **Too specific / stale** — no match, the hook never installs, TLS still fails.
+  Loud and obvious.
+- **Too loose** — matches ordinary function prologues elsewhere in the engine
+  (`55 41 57 41 56 41 55 41 54 53` is just `push rbp/r15/r14/r13/r12/rbx` on x64,
+  present in many unrelated functions). Every match gets forced to return success,
+  so unrelated engine code silently misbehaves and the symptoms look nothing like
+  a certificate problem.
+
+For that reason this skill does not bundle its own pattern set. Use the maintained
+script from
+[NVISOsecurity/disable-flutter-tls-verification](https://github.com/NVISOsecurity/disable-flutter-tls-verification),
+which tracks per-engine patterns and verifies them against a corpus of engine
+binaries (`libflutter_samples/`, checkable with its `verify.py`):
+
+```bash
+curl -LO https://raw.githubusercontent.com/NVISOsecurity/disable-flutter-tls-verification/main/disable-flutter-tls.js
+frida -U -f com.target.app -l disable-flutter-tls.js --no-pause
+# or, without a local copy:
+frida -U --codeshare TheDauntless/disable-flutter-tls-v1 -f com.target.app
+```
+
+If it finds no match, the target's engine build is not in the upstream sample set.
+Hash the engine binary and report it upstream:
+
+```bash
+# Android
+apktool d target.apk -o target_out && md5sum target_out/lib/arm64-v8a/libflutter.so
+# iOS (unencrypted IPA)
+md5sum Payload/Runner.app/Frameworks/Flutter.framework/Flutter
+```
+
+Then use Method A (reFlutter) for the engagement. Widening a pattern until it
+matches is not a fix — it produces the too-loose failure above.
+
+Note that the upstream script covers the Dart/BoringSSL stack only. If the app
+also ships a platform-side pinning plugin, combine it with Objection or the
+`performing-mobile-app-certificate-pinning-bypass` skill; that is outside this
+script's scope.

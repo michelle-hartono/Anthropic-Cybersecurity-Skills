@@ -1,6 +1,6 @@
 ---
 name: bypassing-ssl-pinning-in-flutter-apps
-description: "Intercept HTTPS traffic from Flutter (Dart) mobile apps that ignore the system proxy and trust store. Covers detecting Flutter builds, forcing traffic through an intercepting proxy (including a PCAPdroid + gost SOCKS bridge), defeating BoringSSL certificate validation with reFlutter and Frida hooks on libflutter.so, and selectively bypassing native services like Firebase so authentication keeps working during interception. For both Android and iOS."
+description: "Intercept HTTPS traffic from Flutter (Dart) mobile apps that ignore the system proxy and trust store. Covers detecting Flutter builds, forcing traffic through an intercepting proxy (including a PCAPdroid + gost SOCKS bridge), defeating BoringSSL certificate validation with reFlutter and Frida hooks on libflutter.so, and selectively bypassing native services like Firebase so authentication keeps working during interception. For both Android and iOS. Use when the target is confirmed Flutter (libflutter.so / Flutter.framework) and the proxy shows no HTTPS traffic despite a configured listener and installed CA, or when 'universal' Frida/Objection SSL-pinning bypasses run without error but change nothing. Not for pinning in the platform TLS stack (OkHttp CertificatePinner, TrustManager, NSURLSession, third-party pinning libraries) — use performing-mobile-app-certificate-pinning-bypass for those."
 domain: cybersecurity
 subdomain: mobile-security
 tags:
@@ -68,11 +68,26 @@ authorization.
   out of the app.
 - When you need to reverse engineer a Flutter app's API calls and business logic.
 
+**Do not use** for pinning implemented in the platform TLS stack — OkHttp
+`CertificatePinner`, a custom `TrustManager`/`HostnameVerifier`, `NSURLSession`
+delegate checks, ATS pins, or a third-party pinning library in a native
+Android/iOS app. Those live in Java/Kotlin/ObjC where Objection and the standard
+Frida hooks reach them; use `performing-mobile-app-certificate-pinning-bypass`
+instead. Confirm the framework first (Step 1) — the deciding signal is
+`libflutter.so`/`Flutter.framework`, not the fact that pinning is present.
+
+Note that the two skills compose: a Flutter app can also ship a platform-side
+pinning plugin, in which case run this skill first to get the Dart stack
+intercepting, then that skill for the remaining native pinning.
+
 ## Prerequisites
 
 - Rooted Android device / emulator or jailbroken iOS device (for Frida runtime
   hooks). reFlutter's repackaging path works without root on Android.
 - `frida` and `frida-tools`, `objection`, `apktool`, `adb`.
+- For the Frida path: `disable-flutter-tls.js` from
+  [NVISOsecurity/disable-flutter-tls-verification](https://github.com/NVISOsecurity/disable-flutter-tls-verification)
+  (maintained per-engine pattern set — do not hardcode your own).
 - `reFlutter` (`pip install reflutter`), Android signing tools (`uber-apk-signer`
   or `apksigner` + `zipalign`), and — for iOS — `ios-deploy`/Sideloadly and a
   signing identity (`codesign`) to re-sign the patched IPA.
@@ -152,12 +167,19 @@ codesign -f -s "<signing-identity>" Payload/Runner.app   # or use Sideloadly
 ios-deploy --bundle release.RE.ipa                        # install to the connected device
 ```
 
-**Method B — Frida runtime hook on the engine binary:** hook the BoringSSL
-`session_verify_cert_chain` / `ssl_verify_result` routine so it always returns
-success. Because the engine (`libflutter.so` / `Flutter.framework`) is stripped,
-locate the function by memory **pattern-scanning** the module (patterns are
-architecture- and engine-version specific and must be updated per target — see
-`references/workflows.md` and `scripts/flutter-tls-bypass.js`):
+**Method B — Frida runtime hook on the engine binary:** neutralise the BoringSSL
+routine that validates the chain (`ssl_verify_peer_cert` in `handshake.cc`) so it
+always returns success. The engine (`libflutter.so` / `Flutter.framework`) is
+stripped, so that routine has no exported symbol and must be located by memory
+**pattern-scanning** the module — and the patterns are architecture- *and*
+engine-version specific, shifting with every Flutter release.
+
+Do not hand-roll the scan: use the maintained pattern set from NVISO's
+[disable-flutter-tls-verification](https://github.com/NVISOsecurity/disable-flutter-tls-verification),
+which tracks engine builds and verifies its patterns against a corpus of engine
+binaries. A stale pattern is not a no-op — a loose one matches unrelated function
+prologues and forces those to return success, which corrupts the app in ways that
+look nothing like a TLS error.
 
 On a rooted/jailbroken device, start a `frida-server` whose version matches your
 host `frida-tools` first:
@@ -171,11 +193,22 @@ adb shell "chmod 755 /data/local/tmp/frida-server && su -c '/data/local/tmp/frid
 Then hook the target:
 
 ```bash
+# fetch the maintained script (Android arm64/x64/x86 and iOS arm64)
+curl -LO https://raw.githubusercontent.com/NVISOsecurity/disable-flutter-tls-verification/main/disable-flutter-tls.js
+
 # Android
-frida -U -f com.target.app -l scripts/flutter-tls-bypass.js
+frida -U -f com.target.app -l disable-flutter-tls.js --no-pause
+# or with no local copy at all, via Frida codeshare
+frida -U --codeshare TheDauntless/disable-flutter-tls-v1 -f com.target.app
 # iOS (jailbroken): attach by app process name (often "Runner")
-frida -U -n Runner -l scripts/flutter-tls-bypass.js
+frida -U -n Runner -l disable-flutter-tls.js
 ```
+
+If it reports no pattern match, this app's engine build is not in the upstream
+sample set yet: hash the engine binary (`md5sum lib/<abi>/libflutter.so`, or
+`Payload/Runner.app/Frameworks/Flutter.framework/Flutter` on iOS), check it
+against `libflutter_samples/` upstream and open an issue there — then fall back to
+Method A (reFlutter) for this engagement rather than editing patterns by hand.
 
 ### Step 4: Keep Firebase / native-SDK auth working (selective bypass)
 reFlutter only patches the Dart/BoringSSL stack. Firebase and other FlutterFire
@@ -201,9 +234,9 @@ first-party API calls land in Burp for inspection and tampering.
 
 ### Step 5: Verify interception
 Trigger a login or API-backed screen and confirm requests now appear in Burp/
-mitmproxy with a readable body. If TLS still fails, the pattern in Method B is
-stale for this engine version — fall back to Method A or update the pattern. If
-Firebase login specifically fails, widen the `${GOOG}` bypass ranges (Step 4).
+mitmproxy with a readable body. If TLS still fails, this engine build is outside
+the Method B pattern set — fall back to Method A (reFlutter). If Firebase login
+specifically fails, widen the `${GOOG}` bypass ranges (Step 4).
 
 ### Step 6: (Optional) Recover Dart symbols for deeper analysis
 Run `blutter` against `libapp.so` to reconstruct Dart classes, method names, and
@@ -218,7 +251,7 @@ client-side validation logic.
 | Proxy blindness | Flutter ignores system HTTP proxy → device-level/transparent redirect required |
 | Pinning location | Cert chain verified in native BoringSSL, so Java/ObjC hook bypasses miss it |
 | reFlutter | Patches APK/IPA to disable cert check and force a fixed proxy; repackage + resign |
-| Pattern scan | `libflutter.so` is stripped; the verify function is found by byte-pattern search, version-specific |
+| Pattern scan | `libflutter.so` is stripped, so `ssl_verify_peer_cert` is found by byte-pattern search — architecture- and engine-version specific, so use the maintained upstream set (a loose or stale pattern hooks unrelated functions) |
 | gost | SOCKS5→HTTP bridge between PCAPdroid and Burp; `bypass=` routes chosen CIDRs (Google/Firebase) direct instead of through Burp |
 | Native-SDK services | Firebase/FlutterFire calls run on the native SDK with their own TLS validation — reFlutter does not touch them, so exclude them from MITM to keep auth working |
 | blutter | Dumps Dart snapshot symbols from `libapp.so` for reverse engineering |
@@ -227,6 +260,7 @@ client-side validation logic.
 
 - **reFlutter** — engine-patching for forced proxy + disabled TLS verification.
 - **Frida / frida-tools** — runtime hooking of `libflutter.so`.
+- **disable-flutter-tls-verification (NVISO)** — the maintained Frida script and per-engine pattern set for `ssl_verify_peer_cert`; the supported way to do Method B.
 - **Burp Suite / mitmproxy** — interception (use invisible/transparent mode with redirects).
 - **PCAPdroid** — on-device VPN capture that emits a SOCKS5 stream (no root needed) for proxy-blind and native-SDK traffic.
 - **gost** — SOCKS5→HTTP proxy bridge with per-CIDR `bypass=`, used to feed PCAPdroid capture into Burp while letting Firebase/Google traffic pass through untouched.
@@ -237,13 +271,13 @@ client-side validation logic.
 
 - **"Proxy set, CA installed, still no traffic"** → Flutter ignoring proxy; use reFlutter forced proxy or the PCAPdroid + gost bridge (Step 2).
 - **"Objection android sslpinning disable does nothing"** → pinning is in native BoringSSL; use Method A or B (Step 3), not Java hooks.
-- **"Frida script errors / traffic still 400s after hooking"** → pattern is stale for this engine version; update pattern or switch to reFlutter.
+- **"Frida script errors / traffic still 400s after hooking"** → this engine build is outside the upstream pattern set; report the engine hash to `disable-flutter-tls-verification` and switch to reFlutter for now. Do not loosen a pattern to force a match — a broad pattern hooks unrelated functions and breaks the app.
 - **"Firebase/Google login stops working the moment I turn on MITM"** → native Firebase SDK rejects Burp's cert; do not try to bypass it — exclude Google/Firebase CIDRs from Burp with gost's `bypass=` (Step 4) so auth completes legitimately.
 
 ## Output Format
 
 An interception setup report: app framework confirmation, redirection method used
 (reFlutter forced proxy vs PCAPdroid + gost bridge), TLS-bypass method (reFlutter vs
-Frida pattern + engine version), which services were excluded from MITM (e.g.
+disable-flutter-tls + engine version), which services were excluded from MITM (e.g.
 Firebase/Google CIDRs) and why, a sample of captured HTTPS requests/responses, and
 any endpoints/secrets recovered via blutter.
